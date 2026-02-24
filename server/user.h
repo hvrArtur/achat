@@ -10,6 +10,8 @@
 #include <unordered_map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
+#include <atomic>
 #include <string>
 #pragma comment (lib, "Ws2_32.lib")
 
@@ -29,66 +31,54 @@ class USER{
     }
 };
 
-struct MSG{
-    int type;
-    string data;
+class HUB{
+public:
+    SOCKET acceptingSocket;
+    shared_mutex usersM;
+    unordered_map<string, shared_ptr<USER>> users;
+
+    HUB(int port){
+        int acres;
+        acceptingSocket = INVALID_SOCKET;
+
+        struct addrinfo *result = NULL;
+        struct addrinfo hints;
+
+        ZeroMemory(&hints, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        hints.ai_flags = AI_PASSIVE;
+
+        acres = getaddrinfo(NULL, DEFAULT_PORT, &hints, &result);
+        if (acres != 0) throw runtime_error("getaddrinfo failed with error: " + acres);
+
+        acceptingSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+        if (acceptingSocket == INVALID_SOCKET) {
+            freeaddrinfo(result);
+            throw runtime_error("socket failed with error: " + WSAGetLastError());
+        }
+
+        acres = bind(acceptingSocket, result->ai_addr, (int)result->ai_addrlen);
+        if (acres == SOCKET_ERROR) {
+            freeaddrinfo(result);
+            closesocket(acceptingSocket);
+            throw runtime_error("bind failed with error: " + WSAGetLastError());
+        }
+
+        freeaddrinfo(result);
+
+        acres = listen(acceptingSocket, SOMAXCONN);
+        if (acres == SOCKET_ERROR) {
+            closesocket(acceptingSocket);
+            throw runtime_error("listen failed with error: " + WSAGetLastError());
+        }
+    }
 };
+
 
 mutex usersM;
 unordered_map<string, shared_ptr<USER>> users;
-
-SOCKET createListneningSocket (){
-    int acres;
-
-    SOCKET ListenSocket = INVALID_SOCKET;
-
-    struct addrinfo *result = NULL;
-    struct addrinfo hints;
-
-    ZeroMemory(&hints, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    hints.ai_flags = AI_PASSIVE;
-
-    acres = getaddrinfo(NULL, DEFAULT_PORT, &hints, &result);
-    if (acres != 0) {
-        cout << "getaddrinfo failed with error: " << acres << endl;
-        WSACleanup();
-        return INVALID_SOCKET;
-    }
-
-    // Create a SOCKET for the server to listen for client connections.
-    ListenSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-    if (ListenSocket == INVALID_SOCKET) {
-        cout << "socket failed with error: " << WSAGetLastError() << endl;
-        freeaddrinfo(result);
-        WSACleanup();
-        return INVALID_SOCKET;
-    }
-
-    acres = bind(ListenSocket, result->ai_addr, (int)result->ai_addrlen);
-    if (acres == SOCKET_ERROR) {
-        cout << "bind failed with error: "<< WSAGetLastError() << endl;
-        freeaddrinfo(result);
-        closesocket(ListenSocket);
-        WSACleanup();
-        return INVALID_SOCKET;
-    }
-
-    freeaddrinfo(result);
-
-    acres = listen(ListenSocket, SOMAXCONN);
-    if (acres == SOCKET_ERROR) {
-        cout << "listen failed with error: "
-            << WSAGetLastError() << endl;
-        closesocket(ListenSocket);
-        WSACleanup();
-        return INVALID_SOCKET;
-    }
-
-    return ListenSocket;
-}
 
 int getId(string& id, SOCKET socket){
     sockaddr_in addr;
@@ -232,7 +222,7 @@ void acceptNewSockets (SOCKET listeningSocket){
 
         string id;
         if(getId(id, connectedSocket)) continue;
-        auto newUser = make_shared<USER>();
+        shared_ptr<USER> newUser = make_shared<USER>();
         newUser->socket=connectedSocket;
         usersM.lock();
         users[id] = newUser;
