@@ -11,8 +11,8 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
-#include <atomic>
 #include <string>
+#include <condition_variable>
 #pragma comment (lib, "Ws2_32.lib")
 
 using namespace std;
@@ -22,13 +22,38 @@ using namespace std;
 #define DEFAULT_PORT "27000"
 
 class USER{
-    public:
-        SOCKET socket;
-        string username;
-        mutex sendM;
-    ~USER(){
-        closesocket(socket);
+public:
+    SOCKET clientSocket;
+    string username;
+    mutex sendM;
+    string id;
+
+    USER(SOCKET newSocket){
+        sockaddr_in addr;
+        int addrLen = sizeof(addr);
+
+        if (getpeername(newSocket, (sockaddr*)&addr, &addrLen) != 0) {
+            throw runtime_error("getpeername failed: " + to_string(WSAGetLastError()));
+        }
+
+        char ipStr[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &addr.sin_addr, ipStr, sizeof(ipStr));
+        id = string(ipStr) + ":" + to_string(ntohs(addr.sin_port));
+
+        clientSocket = newSocket;
+
+        listenThread = thread(&USER::listenSocket, this);
     }
+    ~USER(){
+        closesocket(clientSocket);
+        listenThread.join()
+    }
+
+private:
+    void listenSocket(){
+        // Here will be function to listen to socket
+    }
+    thread listenThread;
 };
 
 class HUB{
@@ -37,7 +62,7 @@ public:
     shared_mutex usersM;
     unordered_map<string, shared_ptr<USER>> users;
 
-    HUB(int port){
+    HUB(const char* port){
         int acres;
         acceptingSocket = INVALID_SOCKET;
 
@@ -50,20 +75,20 @@ public:
         hints.ai_protocol = IPPROTO_TCP;
         hints.ai_flags = AI_PASSIVE;
 
-        acres = getaddrinfo(NULL, DEFAULT_PORT, &hints, &result);
-        if (acres != 0) throw runtime_error("getaddrinfo failed with error: " + acres);
+        acres = getaddrinfo(NULL, port, &hints, &result);
+        if (acres != 0) throw runtime_error("getaddrinfo failed with error: " + to_string(acres));
 
         acceptingSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
         if (acceptingSocket == INVALID_SOCKET) {
             freeaddrinfo(result);
-            throw runtime_error("socket failed with error: " + WSAGetLastError());
+            throw runtime_error("socket failed with error: " + to_string(WSAGetLastError()));
         }
 
         acres = bind(acceptingSocket, result->ai_addr, (int)result->ai_addrlen);
         if (acres == SOCKET_ERROR) {
             freeaddrinfo(result);
             closesocket(acceptingSocket);
-            throw runtime_error("bind failed with error: " + WSAGetLastError());
+            throw runtime_error("bind failed with error: " + to_string(WSAGetLastError()));
         }
 
         freeaddrinfo(result);
@@ -71,31 +96,101 @@ public:
         acres = listen(acceptingSocket, SOMAXCONN);
         if (acres == SOCKET_ERROR) {
             closesocket(acceptingSocket);
-            throw runtime_error("listen failed with error: " + WSAGetLastError());
+            throw runtime_error("listen failed with error: " + to_string(WSAGetLastError()));
+        }
+
+        acceptingThread = thread(&HUB::acceptNewSockets, this);
+    }
+
+    ~HUB(){
+        
+        {
+            lock_guard<mutex> lk(acceptingMutex);
+            acceptingAA = false;
+        }
+        acceptingVar.notify_all();
+
+        if (acceptingThread.joinable()) acceptingThread.join();
+        if (acceptingSocket != INVALID_SOCKET) {
+            closesocket(acceptingSocket);
+            acceptingSocket = INVALID_SOCKET;
+        }
+    }
+
+    void startAccepting(){ 
+        {
+            lock_guard<mutex> lk(acceptingMutex);
+            acceptingRN = true;
+        }
+        acceptingVar.notify_all();
+    }
+    void stopAccepting(){ 
+        lock_guard<mutex> lk(acceptingMutex);
+        acceptingRN = false;
+    }
+
+
+private:
+    mutex acceptingMutex;
+    bool acceptingAA{true};
+    bool acceptingRN{false};
+    thread acceptingThread;
+    condition_variable acceptingVar;
+
+    void acceptNewSockets() {
+        while (true) {
+            {
+                unique_lock<mutex> lock(acceptingMutex);
+                acceptingVar.wait(lock, [this] {
+                    return !acceptingAA || acceptingRN;
+                });
+
+                if (!acceptingAA) break;
+            }
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(acceptingSocket, &readfds);
+
+            timeval tv{};
+            tv.tv_sec = 1;
+
+            int r = select(0, &readfds, nullptr, nullptr, &tv);
+            {
+                lock_guard<mutex> lk(acceptingMutex);
+                if (!acceptingAA) break;
+                if (!acceptingRN) continue;
+            }
+
+            if (r == SOCKET_ERROR) {
+                cout << "select error: " << WSAGetLastError() << "\n";
+                continue;
+            }
+            if (r == 0) continue;
+
+            if (FD_ISSET(acceptingSocket, &readfds)) {
+                SOCKET connectedSocket = accept(acceptingSocket, NULL, NULL);
+                if (connectedSocket == INVALID_SOCKET) {
+                    cout << "accept error: " << WSAGetLastError() << "\n";
+                    continue;
+                }
+
+                try { 
+                    shared_ptr<USER> newUser = make_shared<USER>(connectedSocket);
+                    usersM.lock();
+                    users[newUser->id] = newUser;
+                    usersM.unlock();
+                    cout<<"Accepted: "<<newUser->id<<endl;
+                }
+                catch(const exception& e){
+                    cerr << "GetId error: " << e.what() << "        ";
+                    cerr << "Type: " << typeid(e).name() << endl;
+                    closesocket(connectedSocket);
+                    continue;
+                }
+            }
         }
     }
 };
-
-
-mutex usersM;
-unordered_map<string, shared_ptr<USER>> users;
-
-int getId(string& id, SOCKET socket){
-    sockaddr_in addr;
-    int addrLen = sizeof(addr);
-
-    if (getpeername(socket, (sockaddr*)&addr, &addrLen) != 0) {
-        cout << "getpeername failed: " << WSAGetLastError() << endl;
-        closesocket(socket);
-        return 1;
-    }
-
-    char ipStr[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &addr.sin_addr, ipStr, sizeof(ipStr));
-    id = string(ipStr) + ":" + to_string(ntohs(addr.sin_port));
-
-    return 0;
-}
 
 bool recv_all(SOCKET s, char* data, int len) {
     int got = 0;
@@ -208,29 +303,6 @@ void listenSocket(shared_ptr<USER> user, string id){
     users.erase(id);
     usersM.unlock();
     return;
-}
-
-void acceptNewSockets (SOCKET listeningSocket){
-    while(true){
-        SOCKET connectedSocket = INVALID_SOCKET;
-
-        connectedSocket = accept(listeningSocket, NULL, NULL);
-        if (connectedSocket == INVALID_SOCKET) {
-            cout << "Accept failed with error: " << WSAGetLastError() << endl;
-            continue;
-        }
-
-        string id;
-        if(getId(id, connectedSocket)) continue;
-        shared_ptr<USER> newUser = make_shared<USER>();
-        newUser->socket=connectedSocket;
-        usersM.lock();
-        users[id] = newUser;
-        usersM.unlock();
-        thread t(listenSocket, newUser, id);
-        t.detach();
-        cout<<"Accepted: "<<id<<endl;
-    }
 }
 
 int main()
