@@ -13,51 +13,43 @@
 #include <shared_mutex>
 #include <string>
 #include <condition_variable>
+#include <chrono>
 #include <threadPool.h>
 #pragma comment (lib, "Ws2_32.lib")
 
 using namespace std;
 #define DEFAULT_TIMEOUT 10000
+#define TEXT_MSG 10
+#define CONN_TIMEOUT 2
+#define CONN_ERROR 1
+#define CONN_CLOSED 0
 
 struct MSG {
+    string senderId;
+    string senderUsername;
     string data;
     uint8_t command;
+    uint32_t timestamp;
 };
 
-bool recv_all(SOCKET s, char* data, int len) {
-    int got = 0;
-    while (got < len) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(s, &rfds);
-
-        timeval tv;
-        tv.tv_sec  = DEFAULT_TIMEOUT / 1000;
-        tv.tv_usec = (DEFAULT_TIMEOUT % 1000) * 1000;
-
-        int sel = select(0, &rfds, nullptr, nullptr, &tv);
-        if (sel == 0) return false;
-        if (sel < 0)  return false;
-
-        int rc = recv(s, data + got, len - got, 0);
-        if (rc <= 0) return false;
-        got += rc;
+bool detectError (int res, shared_ptr<MSG> msg){
+    msg->timestamp = chrono::duration_cast<chrono::seconds>(chrono::system_clock::now().time_since_epoch()).count();
+    if (res < 0) {
+        msg->command = CONN_ERROR;
+        msg->data = to_string(WSAGetLastError());
+        return true;
     }
-    return true;
-}
-
-bool recv_msg(SOCKET s, MSG& msg) {
-    uint16_t bytes;
-    if (!recv_all(s, (char*)&bytes, 2)) return false;
-    bytes = ntohl(bytes);
-    
-    uint8_t command;
-    if (!recv_all(s, (char*)&command, 1)) return false;
-    command = ntohl(command);
-    
-    msg.data.resize(bytes);
-    msg.command = command;
-    return recv_all(s, msg.data.data(), (int)bytes);
+    if (res == 2) {
+        msg->command = CONN_TIMEOUT;
+        msg->data = to_string(WSAGetLastError());
+        return true;
+    }
+    if (res == 0) {
+        msg->command = CONN_CLOSED;
+        msg->data = "CONN_CLOSED";
+        return true;
+    }
+    return false;
 }
 
 class USER{
@@ -80,7 +72,44 @@ public:
     }
     ~USER(){
         closesocket(clientSocket);
-        listenThread.join();
+        if(listenThread.joinable()) listenThread.join();
+    }
+
+    bool sendMsg(shared_ptr<MSG> msg){
+        lock_guard<mutex> lk(sendM);
+        uint32_t n = static_cast<uint32_t>(msg->data.size());
+        n = (n << 8) | msg->command;
+        int sendres = send(clientSocket, (char*)n, 4, 0 );
+        if (sendres == SOCKET_ERROR) {
+            cout << "Send failed with error: " << WSAGetLastError() << endl;
+            return false;
+        }
+
+        sendres = send(clientSocket, (char*)msg->timestamp, 4, 0 );
+        if (sendres == SOCKET_ERROR) {
+            cout << "Send failed with error: " << WSAGetLastError() << endl;
+            return false;
+        }
+
+        sendres = send(clientSocket, msg->senderId.data(), 16, 0 );
+        if (sendres == SOCKET_ERROR) {
+            cout << "Send failed with error: " << WSAGetLastError() << endl;
+            return false;
+        }
+
+        sendres = send(clientSocket, msg->senderUsername.data(), 24, 0 );
+        if (sendres == SOCKET_ERROR) {
+            cout << "Send failed with error: " << WSAGetLastError() << endl;
+            return false;
+        }
+
+        sendres = send(clientSocket, msg->data.data(), msg->data.size(), 0 );
+        if (sendres == SOCKET_ERROR) {
+            cout << "Send failed with error: " << WSAGetLastError() << endl;
+            return false;
+        }
+
+        return true;
     }
 
     string username;
@@ -88,9 +117,98 @@ public:
 
 private:
     void listenSocket(){
-        // Here will be function to listen to socket
+        while (true) {
+            {
+                unique_lock<mutex> lock(listneningM);
+                listneningVar.wait(lock, [this] { return !listneningAA || listneningRN; });
+
+                if (!listneningAA) break;
+            }
+            shared_ptr<MSG> msg = make_shared<MSG>();
+            msg->senderUsername.resize(15);
+            msg->senderId = id;
+            msg->senderUsername.resize(24);
+            msg->senderUsername = username;
+            bool res = recv_msg(msg);
+            {
+                unique_lock<mutex> lock(listneningM);
+                if (!listneningAA) break;
+            }
+            if(res){
+                if(msg->command == TEXT_MSG){
+                    auto hub = owner;
+                    auto uid = id;
+                    hub->pool.post([hub, msg, uid] {
+                        hub->sendToAll(msg, uid);
+                    });
+                    continue;
+                }else{
+                    cout<< "While listnening got unknown command: [" << msg->command << "] at "<< msg->timestamp << endl;
+                    break;
+                }
+            } else if(msg->command == CONN_ERROR) {
+                cout<< "While listnening got error: [" << msg->data << "] at "<< msg->timestamp << endl;
+                break;
+            } else if(msg->command == CONN_TIMEOUT){
+                continue;
+            } else {
+                cout<< "While listnening got unknown command: [" << msg->command << "] at "<< msg->timestamp << endl;
+                break;
+            }
+        }
+        auto hub = owner;
+        auto uid = id;
+
+        hub->pool.post([hub, uid] {
+            hub->disconnectUser(uid);
+        });
     }
 
+    int recv_all(char* data, int len) {
+        int got = 0;
+        while (got < len) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(clientSocket, &rfds);
+
+            timeval tv;
+            tv.tv_sec  = DEFAULT_TIMEOUT / 1000;
+            tv.tv_usec = (DEFAULT_TIMEOUT % 1000) * 1000;
+
+            int sel = select(0, &rfds, nullptr, nullptr, &tv);
+            if (sel == 0) return CONN_TIMEOUT;
+            if (sel < 0) return CONN_ERROR;
+
+            int rc = recv(clientSocket, data + got, len - got, 0);
+            if (rc <= 0) return rc;
+            got += rc;
+        }
+        return 3;
+    }
+
+    bool recv_msg(shared_ptr<MSG> msg) {
+        uint32_t n;
+        int res = recv_all((char*)&n, 4);
+        bool err = detectError(res, msg);
+        if(err) return err;
+        n = ntohl(n);
+
+        uint32_t bytes = n >> 8;
+        uint8_t command = n & 0xFF;
+        
+        msg->data.resize(bytes);
+        msg->command = command;
+        
+        res = recv_all(msg->data.data(), (int)bytes);
+        err = detectError(res, msg);
+        if(err) return err;
+        return true;
+    }
+
+    mutex listneningM;
+    bool listneningAA{true};
+    bool listneningRN{true};
+    condition_variable listneningVar;
     HUB* owner;
     mutex sendM;
     SOCKET clientSocket;
@@ -161,24 +279,41 @@ public:
         }
         acceptingVar.notify_all();
     }
+
     void stopAccepting(){ 
         lock_guard<mutex> lk(acceptingMutex);
         acceptingRN = false;
     }
 
+    void disconnectUser(string id){
+        unique_lock<shared_mutex> lk(usersM);
+        users.erase(id);
+    }
+
+    void sendToAll(shared_ptr<MSG> msg, string exception){
+        usersM.lock();
+        auto snapshot = make_unique<shared_ptr<USER>[]>(users.size());
+        size_t len = 0;
+        for (auto& [id, user] : users) {
+            if (id == exception) continue;
+            snapshot[len++] = user;
+        }
+        usersM.unlock();
+
+        for(size_t i = 0; i<len; i++){
+            snapshot[i]->sendMsg(msg);
+        }
+        return;
+    }
+
     THREAD_POOL pool;
-    SOCKET acceptingSocket;
-    shared_mutex usersM;
-    unordered_map<string, shared_ptr<USER>> users;
 
 private:
     void acceptNewSockets() {
         while (true) {
             {
                 unique_lock<mutex> lock(acceptingMutex);
-                acceptingVar.wait(lock, [this] {
-                    return !acceptingAA || acceptingRN;
-                });
+                acceptingVar.wait(lock, [this] { return !acceptingAA || acceptingRN; });
 
                 if (!acceptingAA) break;
             }
@@ -229,89 +364,9 @@ private:
     mutex acceptingMutex;
     bool acceptingAA{true};
     bool acceptingRN{false};
-    thread acceptingThread;
     condition_variable acceptingVar;
+    thread acceptingThread;
+    SOCKET acceptingSocket;
+    shared_mutex usersM;
+    unordered_map<string, shared_ptr<USER>> users;
 };
-
-
-void sendToAll(char* recvbuf, int acres, string exception){
-    usersM.lock();
-    auto snapshot = make_unique<shared_ptr<USER>[]>(users.size());
-    size_t len = 0;
-    for (auto& [id, user] : users) {
-        if (id == exception) continue;
-        snapshot[len++] = user;
-    }
-    usersM.unlock();
-
-    for(size_t i = 0; i<len; i++){
-        snapshot[i]->sendM.lock();
-        string id;
-        getId(id, snapshot[i]->socket);
-        int sendres = send( snapshot[i]->socket, recvbuf, acres, 0 );
-        cout << "Sending ["<< recvbuf << "] with length: "<<acres << endl;
-        if (sendres == SOCKET_ERROR) {
-            cout << "Send failed with error: " << WSAGetLastError() << endl;
-        }
-        snapshot[i]->sendM.unlock();
-    }
-    delete[] recvbuf;
-    return;
-}
-
-void listenSocket(shared_ptr<USER> user, string id){
-    int acres = 0;
-    char bytesc[DEFAULT_SYSTEM_BUFLEN+1];
-    char commandc[DEFAULT_SYSTEM_BUFLEN+1];
-    int bytes;
-    int command;
-    do {
-        bytes = 0;
-        command = 0;
-        char* recvbuf = new char[DEFAULT_BUFLEN+1 ];
-
-        acres = recv(user->socket, bytesc, DEFAULT_SYSTEM_BUFLEN, 0);
-        if(acres < 0){
-            delete[] recvbuf;
-            cout << "Recv failed with error: " << WSAGetLastError() << " From: " << id << endl;
-        } else if(acres == 0){
-            delete[] recvbuf;
-            break;
-        }
-        bytesc[DEFAULT_SYSTEM_BUFLEN] = '\0';
-
-        acres = recv(user->socket, commandc, DEFAULT_SYSTEM_BUFLEN, 0);
-        if(acres < 0){
-            delete[] recvbuf;
-            cout << "Recv failed with error: " << WSAGetLastError() << " From: " << id << endl;
-        } else if(acres == 0){
-            delete[] recvbuf;
-            break;
-        }
-        commandc[DEFAULT_SYSTEM_BUFLEN] = '\0';
-
-        acres = recv(user->socket, bytesc, DEFAULT_BUFLEN, 0);
-        if(acres < 0){
-            delete[] recvbuf;
-            cout << "Recv failed with error: " << WSAGetLastError() << " From: " << id << endl;
-        } else if(acres == 0){
-            delete[] recvbuf;
-            break;
-        }
-        recvbuf[acres] = '\0';
-        cout << "Received: [" << recvbuf << "] From: " << id << endl;
-        bytes = atoi(bytesc);
-        if(bytes = 0){
-
-        }
-        sendToAll(recvbuf, bytes, id);
-
-    } while (true);
-
-    cout << "Closing connection with: " << id << endl;
-    closesocket(user->socket);
-    usersM.lock();
-    users.erase(id);
-    usersM.unlock();
-    return;
-} 
