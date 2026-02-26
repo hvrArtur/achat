@@ -13,22 +13,56 @@
 #include <shared_mutex>
 #include <string>
 #include <condition_variable>
+#include <threadPool.h>
 #pragma comment (lib, "Ws2_32.lib")
 
 using namespace std;
 #define DEFAULT_TIMEOUT 10000
-#define DEFAULT_BUFLEN 511
-#define DEFAULT_SYSTEM_BUFLEN 3
-#define DEFAULT_PORT "27000"
+
+struct MSG {
+    string data;
+    uint8_t command;
+};
+
+bool recv_all(SOCKET s, char* data, int len) {
+    int got = 0;
+    while (got < len) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(s, &rfds);
+
+        timeval tv;
+        tv.tv_sec  = DEFAULT_TIMEOUT / 1000;
+        tv.tv_usec = (DEFAULT_TIMEOUT % 1000) * 1000;
+
+        int sel = select(0, &rfds, nullptr, nullptr, &tv);
+        if (sel == 0) return false;
+        if (sel < 0)  return false;
+
+        int rc = recv(s, data + got, len - got, 0);
+        if (rc <= 0) return false;
+        got += rc;
+    }
+    return true;
+}
+
+bool recv_msg(SOCKET s, MSG& msg) {
+    uint16_t bytes;
+    if (!recv_all(s, (char*)&bytes, 2)) return false;
+    bytes = ntohl(bytes);
+    
+    uint8_t command;
+    if (!recv_all(s, (char*)&command, 1)) return false;
+    command = ntohl(command);
+    
+    msg.data.resize(bytes);
+    msg.command = command;
+    return recv_all(s, msg.data.data(), (int)bytes);
+}
 
 class USER{
 public:
-    SOCKET clientSocket;
-    string username;
-    mutex sendM;
-    string id;
-
-    USER(SOCKET newSocket){
+    USER(SOCKET newSocket, HUB* owner) : owner(owner){
         sockaddr_in addr;
         int addrLen = sizeof(addr);
 
@@ -46,23 +80,26 @@ public:
     }
     ~USER(){
         closesocket(clientSocket);
-        listenThread.join()
+        listenThread.join();
     }
+
+    string username;
+    string id;
 
 private:
     void listenSocket(){
         // Here will be function to listen to socket
     }
+
+    HUB* owner;
+    mutex sendM;
+    SOCKET clientSocket;
     thread listenThread;
 };
 
 class HUB{
 public:
-    SOCKET acceptingSocket;
-    shared_mutex usersM;
-    unordered_map<string, shared_ptr<USER>> users;
-
-    HUB(const char* port){
+    HUB(const char* port, size_t workerAmount) : pool(workerAmount){
         int acres;
         acceptingSocket = INVALID_SOCKET;
 
@@ -129,14 +166,12 @@ public:
         acceptingRN = false;
     }
 
+    THREAD_POOL pool;
+    SOCKET acceptingSocket;
+    shared_mutex usersM;
+    unordered_map<string, shared_ptr<USER>> users;
 
 private:
-    mutex acceptingMutex;
-    bool acceptingAA{true};
-    bool acceptingRN{false};
-    thread acceptingThread;
-    condition_variable acceptingVar;
-
     void acceptNewSockets() {
         while (true) {
             {
@@ -175,7 +210,7 @@ private:
                 }
 
                 try { 
-                    shared_ptr<USER> newUser = make_shared<USER>(connectedSocket);
+                    shared_ptr<USER> newUser = make_shared<USER>(connectedSocket, this);
                     usersM.lock();
                     users[newUser->id] = newUser;
                     usersM.unlock();
@@ -190,38 +225,14 @@ private:
             }
         }
     }
+
+    mutex acceptingMutex;
+    bool acceptingAA{true};
+    bool acceptingRN{false};
+    thread acceptingThread;
+    condition_variable acceptingVar;
 };
 
-bool recv_all(SOCKET s, char* data, int len) {
-    int got = 0;
-    while (got < len) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(s, &rfds);
-
-        timeval tv;
-        tv.tv_sec  = DEFAULT_TIMEOUT / 1000;
-        tv.tv_usec = (DEFAULT_TIMEOUT % 1000) * 1000;
-
-        int sel = select(0, &rfds, nullptr, nullptr, &tv);
-        if (sel == 0) return false;
-        if (sel < 0)  return false;
-
-        int rc = recv(s, data + got, len - got, 0);
-        if (rc <= 0) return false;
-        got += rc;
-    }
-    return true;
-}
-
-int recv_msg(SOCKET s, char* data) {
-    char bytesc[DEFAULT_SYSTEM_BUFLEN+1];
-    if (!recv_all(s, bytesc, DEFAULT_SYSTEM_BUFLEN)) return false;
-    
-    
-    if (n == 0) return true;
-    return recv_all(s, out.data(), (int)n);
-}
 
 void sendToAll(char* recvbuf, int acres, string exception){
     usersM.lock();
@@ -303,37 +314,4 @@ void listenSocket(shared_ptr<USER> user, string id){
     users.erase(id);
     usersM.unlock();
     return;
-}
-
-int main()
-{
-    WSADATA wsaData;
-    int acres;
-
-    struct addrinfo *result = NULL;
-    struct addrinfo hints;
-
-    int iSendResult;
-    char recvbuf[DEFAULT_BUFLEN];
-    int recvbuflen = DEFAULT_BUFLEN;
-    
-    acres = WSAStartup(MAKEWORD(2,2), &wsaData);
-    if (acres != 0) {
-        cout << "WSAStartup error: " << acres << endl;
-        return 1;
-    }
-
-    SOCKET listeningSocket = createListneningSocket();
-    if(listeningSocket == INVALID_SOCKET){
-        cout << "Creation of listnening socket failed: " << WSAGetLastError() << endl;
-        WSACleanup();
-        return 1;
-    }
-    
-    thread t(acceptNewSockets, listeningSocket);
-    t.join();
-    closesocket(listeningSocket);
-    WSACleanup();
-
-    return 0;
-}
+} 
