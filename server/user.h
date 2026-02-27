@@ -1,5 +1,3 @@
-#undef UNICODE
-
 #define WIN32_LEAN_AND_MEAN
 
 #include <winsock2.h>
@@ -19,6 +17,7 @@
 
 using namespace std;
 #define DEFAULT_TIMEOUT 10000
+#define DEFAULT_PAYLOAD_LENGTH 1024
 #define TEXT_MSG 10
 #define CONN_TIMEOUT 2
 #define CONN_ERROR 1
@@ -32,25 +31,7 @@ struct MSG {
     uint32_t timestamp;
 };
 
-bool detectError (int res, shared_ptr<MSG> msg){
-    msg->timestamp = chrono::duration_cast<chrono::seconds>(chrono::system_clock::now().time_since_epoch()).count();
-    if (res < 0) {
-        msg->command = CONN_ERROR;
-        msg->data = to_string(WSAGetLastError());
-        return true;
-    }
-    if (res == 2) {
-        msg->command = CONN_TIMEOUT;
-        msg->data = to_string(WSAGetLastError());
-        return true;
-    }
-    if (res == 0) {
-        msg->command = CONN_CLOSED;
-        msg->data = "CONN_CLOSED";
-        return true;
-    }
-    return false;
-}
+class HUB;
 
 class USER{
 public:
@@ -63,7 +44,7 @@ public:
         }
 
         char ipStr[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &addr.sin_addr, ipStr, sizeof(ipStr));
+        if(!inet_ntop(AF_INET, &addr.sin_addr, ipStr, sizeof(ipStr))) throw runtime_error("inet_ntop failed: " + to_string(WSAGetLastError()));;
         id = string(ipStr) + ":" + to_string(ntohs(addr.sin_port));
 
         clientSocket = newSocket;
@@ -71,47 +52,65 @@ public:
         listenThread = thread(&USER::listenSocket, this);
     }
     ~USER(){
+        {
+            lock_guard<mutex>  lk(listneningM);
+            bool listneningAA =false;
+        }
+        listneningVar.notify_all();
+        shutdown(clientSocket, SD_BOTH);
         closesocket(clientSocket);
         if(listenThread.joinable()) listenThread.join();
     }
 
-    bool sendMsg(shared_ptr<MSG> msg){
+    bool sendTextMsg(shared_ptr<MSG> msg){
+        msg->senderId.resize(21, '\0');
+        msg->senderUsername.resize(24, '\0');
         lock_guard<mutex> lk(sendM);
-        uint32_t n = static_cast<uint32_t>(msg->data.size());
-        n = (n << 8) | msg->command;
-        int sendres = send(clientSocket, (char*)n, 4, 0 );
-        if (sendres == SOCKET_ERROR) {
-            cout << "Send failed with error: " << WSAGetLastError() << endl;
+        uint32_t header = static_cast<uint32_t>(msg->data.size());
+        header = (header << 8) | msg->command;
+        header = htonl(header);
+        if (!sendAll(reinterpret_cast<char*>(&header), 4)) {
+            cout << "Send of header failed with error: " << WSAGetLastError() << endl;
             return false;
         }
 
-        sendres = send(clientSocket, (char*)msg->timestamp, 4, 0 );
-        if (sendres == SOCKET_ERROR) {
-            cout << "Send failed with error: " << WSAGetLastError() << endl;
+        uint32_t ts = htonl(msg->timestamp);
+        if(!sendAll(reinterpret_cast<char*>(&ts), sizeof(ts))) {
+            cout << "Send of timestamp failed with error: " << WSAGetLastError() << endl;
             return false;
         }
 
-        sendres = send(clientSocket, msg->senderId.data(), 16, 0 );
-        if (sendres == SOCKET_ERROR) {
-            cout << "Send failed with error: " << WSAGetLastError() << endl;
+        if (!sendAll(msg->senderId.data(), 21)) {
+            cout << "Send of senderId failed with error: " << WSAGetLastError() << endl;
             return false;
         }
 
-        sendres = send(clientSocket, msg->senderUsername.data(), 24, 0 );
-        if (sendres == SOCKET_ERROR) {
-            cout << "Send failed with error: " << WSAGetLastError() << endl;
+        if (!sendAll(msg->senderUsername.data(), 24)) {
+            cout << "Send of username failed with error: " << WSAGetLastError() << endl;
             return false;
         }
 
-        sendres = send(clientSocket, msg->data.data(), msg->data.size(), 0 );
-        if (sendres == SOCKET_ERROR) {
-            cout << "Send failed with error: " << WSAGetLastError() << endl;
+        if (!sendAll(msg->data.data(), msg->data.size())) {
+            cout << "Send of main data with error: " << WSAGetLastError() << endl;
             return false;
         }
 
         return true;
     }
 
+    void startListnening(){ 
+        {
+            lock_guard<mutex> lk(listneningM);
+            listneningRN = true;
+        }
+        listneningVar.notify_all();
+    }
+
+    void stopListening(){ 
+        lock_guard<mutex> lk(listneningM);
+        listneningRN = false;
+    }
+    
     string username;
     string id;
 
@@ -125,11 +124,9 @@ private:
                 if (!listneningAA) break;
             }
             shared_ptr<MSG> msg = make_shared<MSG>();
-            msg->senderUsername.resize(15);
             msg->senderId = id;
-            msg->senderUsername.resize(24);
             msg->senderUsername = username;
-            bool res = recv_msg(msg);
+            bool res = recvMsg(msg);
             {
                 unique_lock<mutex> lock(listneningM);
                 if (!listneningAA) break;
@@ -164,7 +161,40 @@ private:
         });
     }
 
-    int recv_all(char* data, int len) {
+    bool sendAll(char* data, int len) {
+        int sent = 0;
+        while (sent < len) {
+            int sn = send(clientSocket, data + sent, len - sent, 0);
+            if (sn <= 0) return false;
+            sent += sn;
+        }
+        return true;
+    }
+
+    bool detectRcvError (int res, shared_ptr<MSG> msg){
+        msg->timestamp = chrono::duration_cast<chrono::seconds>(chrono::system_clock::now().time_since_epoch()).count();
+        if (res == -1) return false;
+        if (res == 2) {
+            msg->command = CONN_TIMEOUT;
+            msg->data = "CONN_TIMEOUT";
+            return true;
+        }
+        if (res == 1) {
+            msg->command = CONN_ERROR;
+            msg->data = to_string(WSAGetLastError());
+            return true;
+        }
+        if (res == 0) {
+            msg->command = CONN_CLOSED;
+            msg->data = "CONN_CLOSED";
+            return true;
+        }
+        msg->command = CONN_ERROR;
+        msg->data = to_string(WSAGetLastError());
+        return true;
+    }
+
+    int recvAll(char* data, int len) {
         int got = 0;
         while (got < len) {
             fd_set rfds;
@@ -180,28 +210,36 @@ private:
             if (sel < 0) return CONN_ERROR;
 
             int rc = recv(clientSocket, data + got, len - got, 0);
-            if (rc <= 0) return rc;
+            if (rc < 0) return CONN_ERROR;
+            if (rc == 0) return CONN_CLOSED;
             got += rc;
         }
-        return 3;
+        return -1;
     }
 
-    bool recv_msg(shared_ptr<MSG> msg) {
+    bool recvMsg(shared_ptr<MSG> msg) {
         uint32_t n;
-        int res = recv_all((char*)&n, 4);
-        bool err = detectError(res, msg);
-        if(err) return err;
+        int res = recvAll((char*)&n, 4);
+        bool err = detectRcvError(res, msg);
+        if(err) return false;
         n = ntohl(n);
 
         uint32_t bytes = n >> 8;
+        if(bytes>DEFAULT_PAYLOAD_LENGTH) {
+            msg->timestamp = chrono::duration_cast<chrono::seconds>(
+                chrono::system_clock::now().time_since_epoch()
+            ).count();
+            msg->command = CONN_ERROR;
+            msg->data = "PAYLOAD_TOO_LARGE";
+        };
         uint8_t command = n & 0xFF;
         
         msg->data.resize(bytes);
         msg->command = command;
         
-        res = recv_all(msg->data.data(), (int)bytes);
-        err = detectError(res, msg);
-        if(err) return err;
+        res = recvAll(msg->data.data(), (int)bytes);
+        err = detectRcvError(res, msg);
+        if(err) return false;
         return true;
     }
 
@@ -263,13 +301,26 @@ public:
             lock_guard<mutex> lk(acceptingMutex);
             acceptingAA = false;
         }
-        acceptingVar.notify_all();
 
+        {
+            unique_lock<mutex> lk(pool.m);
+            pool.stopAA = true;
+        }
+        acceptingVar.notify_all();
         if (acceptingThread.joinable()) acceptingThread.join();
         if (acceptingSocket != INVALID_SOCKET) {
             closesocket(acceptingSocket);
             acceptingSocket = INVALID_SOCKET;
         }
+
+        {   
+            shared_lock<shared_mutex> lk(usersM);
+            for (auto& [id, user] : users) {
+                user->stopListening();
+            }
+        }
+
+        pool.killWorkers();
     }
 
     void startAccepting(){ 
@@ -291,22 +342,21 @@ public:
     }
 
     void sendToAll(shared_ptr<MSG> msg, string exception){
-        usersM.lock();
-        auto snapshot = make_unique<shared_ptr<USER>[]>(users.size());
+        std::unique_ptr<std::shared_ptr<USER>[]> snapshot;
         size_t len = 0;
-        for (auto& [id, user] : users) {
-            if (id == exception) continue;
-            snapshot[len++] = user;
+        {   
+            shared_lock<shared_mutex> lk(usersM);
+            snapshot = make_unique<shared_ptr<USER>[]>(users.size());
+            for (auto& [id, user] : users) {
+                if (id == exception) continue;
+                snapshot[len++] = user;
+            }
         }
-        usersM.unlock();
-
         for(size_t i = 0; i<len; i++){
-            snapshot[i]->sendMsg(msg);
+            snapshot[i]->sendTextMsg(msg);
         }
         return;
     }
-
-    THREAD_POOL pool;
 
 private:
     void acceptNewSockets() {
@@ -346,9 +396,10 @@ private:
 
                 try { 
                     shared_ptr<USER> newUser = make_shared<USER>(connectedSocket, this);
-                    usersM.lock();
-                    users[newUser->id] = newUser;
-                    usersM.unlock();
+                    {
+                        unique_lock<shared_mutex> lk(usersM);
+                        users[newUser->id] = newUser;
+                    }
                     cout<<"Accepted: "<<newUser->id<<endl;
                 }
                 catch(const exception& e){
@@ -369,4 +420,6 @@ private:
     SOCKET acceptingSocket;
     shared_mutex usersM;
     unordered_map<string, shared_ptr<USER>> users;
+public:
+    THREAD_POOL pool;
 };

@@ -5,6 +5,7 @@
 #include <functional>
 #include <utility>
 #include <vector>
+#include <iostream>
 
 using namespace std;
 
@@ -18,6 +19,42 @@ public:
     ~THREAD_POOL() {
         killWorkers();
     }
+
+    class WORKER {
+        public:
+
+            explicit WORKER(THREAD_POOL* owner) : owner(owner), workingThread([this]{ run(); }) {}
+
+        private:
+
+            void run() {
+                while (true) {
+                    function<void()> task;
+
+                    {
+                        unique_lock<mutex> lock(owner->m);
+                        owner->cv.wait(lock, [this] { return owner->stopAA || (!owner->stopRN && !owner->tasks.empty()); });
+
+                        if (owner->stopAA) break;
+
+                        task = move(owner->tasks.front());
+                        owner->tasks.pop();
+                    }
+                    try{
+                        task();
+                    }catch(const exception& e){
+                        cerr << "Error while doing task: " << e.what() << endl;
+                        cerr << "Type: " << typeid(e).name() << endl;
+                    }
+                }
+            }
+
+            THREAD_POOL* owner;
+            function<void()> task;
+
+        public:
+            thread workingThread;
+    };
 
     void post(function<void()> task) {
         {
@@ -52,46 +89,19 @@ public:
     bool stopAA{false};
     queue<function<void()>> tasks;
 
-private:
     void killWorkers(){
         {
             unique_lock<mutex> lock(m);
             stopAA = true;
         }
         cv.notify_all();
-        for(size_t i = 0; i<workers.size(); i++) {
-            if(workers[i].workingThread.joinable()) workers[i].workingThread.join();
+        while (!workers.empty()) {
+            auto& w = workers.back();
+            if (w.workingThread.joinable()) w.workingThread.join();
+            workers.pop_back();
         }
     }
-    vector<WORKER> workers;
-};
-
-class WORKER {
-public:
-
-    explicit WORKER(THREAD_POOL* owner) : owner(owner), workingThread([this]{ run(); }) {}
-    thread workingThread;
 
 private:
-
-    void run() {
-        while (true) {
-            function<void()> task;
-
-            {
-                unique_lock<mutex> lock(owner->m);
-                owner->cv.wait(lock, [this] { return owner->stopAA || (!owner->stopRN && !owner->tasks.empty()); });
-
-                if (owner->stopAA) break;
-
-                task = std::move(owner->tasks.front());
-                owner->tasks.pop();
-            }
-
-            task();
-        }
-    }
-
-    THREAD_POOL* owner;
-    function<void()> task;
+    vector<WORKER> workers;
 };
