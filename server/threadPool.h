@@ -7,8 +7,6 @@
 #include <vector>
 #include <iostream>
 
-using namespace std;
-
 class THREAD_POOL {
 public:
     THREAD_POOL(size_t n) {
@@ -29,70 +27,72 @@ public:
 
             void run() {
                 while (true) {
-                    function<void()> task;
+                    std::function<void()> task;
 
                     {
-                        unique_lock<mutex> lock(owner->m);
-                        owner->cv.wait(lock, [this] { return owner->stopAA || (!owner->stopRN && !owner->tasks.empty()); });
+                        std::unique_lock<std::mutex> lock(owner->m);
+                        owner->cv.wait(lock, [this] { return !owner->living || (owner->working && !owner->tasks.empty()); });
 
-                        if (owner->stopAA) break;
+                        if (!owner->living) break;
 
-                        task = move(owner->tasks.front());
+                        task = std::move(owner->tasks.front());
                         owner->tasks.pop();
                     }
                     try{
                         task();
-                    }catch(const exception& e){
-                        cerr << "Error while doing task: " << e.what() << endl;
-                        cerr << "Type: " << typeid(e).name() << endl;
+                    }catch(const std::exception& e){
+                        std::cerr << "Error while doing task: " << e.what() << std::endl;
+                        std::cerr << "Type: " << typeid(e).name() << std::endl;
+                    }catch(...){
+                        std::cerr << "Uknown errro while doing task" << std::endl;
                     }
                 }
             }
 
             THREAD_POOL* owner;
-            function<void()> task;
+            std::function<void()> task;
 
         public:
-            thread workingThread;
+            std::thread workingThread;
     };
 
-    void post(function<void()> task) {
+    void post(std::function<void()> task) {
         {
-            lock_guard<mutex> lock(m);
-            if(stopAA) return;
-            tasks.push(move(task));
+            std::lock_guard<std::mutex> lock(m);
+            if(!living) return;
+            tasks.push(std::move(task));
         }
         cv.notify_one();
     }
 
     void stopPool() {
         {
-            lock_guard<mutex> lock(m);
-            if (stopRN) return;
-            stopRN = true;
+            std::lock_guard<std::mutex> lock(m);
+            if (!working) return;
+            working = false;
         }
         cv.notify_all();
     }
 
     void startPool() {
         {
-            lock_guard<mutex> lock(m);
-            if (!stopRN) return;
-            stopRN = false;
+            std::lock_guard<std::mutex> lock(m);
+            if (working) return;
+            working = true;
         }
         cv.notify_all();
     }
 
-    mutex m;
-    condition_variable cv;
-    bool stopRN{false};
-    bool stopAA{false};
-    queue<function<void()>> tasks;
+    std::mutex m;
+    std::condition_variable cv;
+    bool working{true};
+    bool living{true};
+    std::queue<std::function<void()>> tasks;
 
     void killWorkers(){
         {
-            unique_lock<mutex> lock(m);
-            stopAA = true;
+            std::unique_lock<std::mutex> lock(m);
+            living = false;
         }
         cv.notify_all();
         while (!workers.empty()) {
@@ -103,5 +103,5 @@ public:
     }
 
 private:
-    vector<WORKER> workers;
+    std::vector<WORKER> workers;
 };

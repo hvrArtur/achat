@@ -15,7 +15,6 @@
 #include <threadPool.h>
 #pragma comment (lib, "Ws2_32.lib")
 
-using namespace std;
 #define DEFAULT_TIMEOUT 10000
 #define DEFAULT_PAYLOAD_LENGTH 1024
 #define TEXT_MSG 10
@@ -24,9 +23,9 @@ using namespace std;
 #define CONN_CLOSED 0
 
 struct MSG {
-    string senderId;
-    string senderUsername;
-    string data;
+    std::string senderId;
+    std::string senderUsername;
+    std::string data;
     uint8_t command;
     uint32_t timestamp;
 };
@@ -40,21 +39,21 @@ public:
         int addrLen = sizeof(addr);
 
         if (getpeername(newSocket, (sockaddr*)&addr, &addrLen) != 0) {
-            throw runtime_error("getpeername failed: " + to_string(WSAGetLastError()));
+            throw std::runtime_error("getpeername failed: " + std::to_string(WSAGetLastError()));
         }
 
         char ipStr[INET_ADDRSTRLEN];
-        if(!inet_ntop(AF_INET, &addr.sin_addr, ipStr, sizeof(ipStr))) throw runtime_error("inet_ntop failed: " + to_string(WSAGetLastError()));;
-        id = string(ipStr) + ":" + to_string(ntohs(addr.sin_port));
+        if(!inet_ntop(AF_INET, &addr.sin_addr, ipStr, sizeof(ipStr))) throw std::runtime_error("inet_ntop failed: " + std::to_string(WSAGetLastError()));;
+        id = std::string(ipStr) + ":" + std::to_string(ntohs(addr.sin_port));
 
         clientSocket = newSocket;
 
-        listenThread = thread(&USER::listenSocket, this);
+        listenThread = std::thread(&USER::listenSocket, this);
     }
     ~USER(){
         {
-            lock_guard<mutex>  lk(listneningM);
-            bool listneningAA =false;
+            std::lock_guard<std::mutex>  lk(listneningM);
+            living =false;
         }
         listneningVar.notify_all();
         shutdown(clientSocket, SD_BOTH);
@@ -62,36 +61,36 @@ public:
         if(listenThread.joinable()) listenThread.join();
     }
 
-    bool sendTextMsg(shared_ptr<MSG> msg){
+    bool sendTextMsg(std::shared_ptr<MSG> msg){
         msg->senderId.resize(21, '\0');
         msg->senderUsername.resize(24, '\0');
-        lock_guard<mutex> lk(sendM);
+        std::lock_guard<std::mutex> lk(sendM);
         uint32_t header = static_cast<uint32_t>(msg->data.size());
         header = (header << 8) | msg->command;
         header = htonl(header);
         if (!sendAll(reinterpret_cast<char*>(&header), 4)) {
-            cout << "Send of header failed with error: " << WSAGetLastError() << endl;
+            std::cout << "Send of header failed with error: " << WSAGetLastError() << std::endl;
             return false;
         }
 
         uint32_t ts = htonl(msg->timestamp);
         if(!sendAll(reinterpret_cast<char*>(&ts), sizeof(ts))) {
-            cout << "Send of timestamp failed with error: " << WSAGetLastError() << endl;
+            std::cout << "Send of timestamp failed with error: " << WSAGetLastError() << std::endl;
             return false;
         }
 
         if (!sendAll(msg->senderId.data(), 21)) {
-            cout << "Send of senderId failed with error: " << WSAGetLastError() << endl;
+            std::cout << "Send of senderId failed with error: " << WSAGetLastError() << std::endl;
             return false;
         }
 
         if (!sendAll(msg->senderUsername.data(), 24)) {
-            cout << "Send of username failed with error: " << WSAGetLastError() << endl;
+            std::cout << "Send of username failed with error: " << WSAGetLastError() << std::endl;
             return false;
         }
 
         if (!sendAll(msg->data.data(), msg->data.size())) {
-            cout << "Send of main data with error: " << WSAGetLastError() << endl;
+            std::cout << "Send of main data with error: " << WSAGetLastError() << std::endl;
             return false;
         }
 
@@ -100,66 +99,75 @@ public:
 
     void startListnening(){ 
         {
-            lock_guard<mutex> lk(listneningM);
-            listneningRN = true;
+            std::lock_guard<std::mutex> lk(listneningM);
+            listnening = true;
         }
         listneningVar.notify_all();
     }
 
     void stopListening(){ 
-        lock_guard<mutex> lk(listneningM);
-        listneningRN = false;
+        std::lock_guard<std::mutex> lk(listneningM);
+        listnening = false;
     }
     
-    string username;
-    string id;
+    std::string username;
+    std::string id;
 
 private:
-    void listenSocket(){
-        while (true) {
-            {
-                unique_lock<mutex> lock(listneningM);
-                listneningVar.wait(lock, [this] { return !listneningAA || listneningRN; });
+        void listenSocket(){
+            while (true) {
+                {
+                    std::unique_lock<std::mutex> lock(listneningM);
+                    listneningVar.wait(lock, [this] { return !living || listnening; });
 
-                if (!listneningAA) break;
-            }
-            shared_ptr<MSG> msg = make_shared<MSG>();
-            msg->senderId = id;
-            msg->senderUsername = username;
-            bool res = recvMsg(msg);
-            {
-                unique_lock<mutex> lock(listneningM);
-                if (!listneningAA) break;
-            }
-            if(res){
-                if(msg->command == TEXT_MSG){
-                    auto hub = owner;
-                    auto uid = id;
-                    hub->pool.post([hub, msg, uid] {
-                        hub->sendToAll(msg, uid);
-                    });
+                    if (!living) break;
+                }
+                std::shared_ptr<MSG> msg = std::make_shared<MSG>();
+                msg->senderId = id;
+                msg->senderUsername = username;
+                bool res = recvMsg(msg);
+                {
+                    std::unique_lock<std::mutex> lock(listneningM);
+                    if (!living) break;
+                    if (!listnening) continue;
+                }
+                if(res){
+                    if(msg->command == TEXT_MSG){
+                        auto hub = owner;
+                        auto uid = id;
+                        {
+                            std::unique_lock<std::mutex> lock(owner->acceptingMutex);
+                            if (!owner->living) return;
+                        }
+                        hub->pool.post([hub, msg, uid] {
+                            hub->sendToAll(msg, uid);
+                        });
+                        continue;
+                    }else{
+                        std::cout<< "While listnening got unknown command: [" << msg->command << "] at "<< msg->timestamp << std::endl;
+                        break;
+                    }
+                } else if(msg->command == CONN_ERROR) {
+                    std::cout<< "While listnening got error: [" << msg->data << "] at "<< msg->timestamp << std::endl;
+                    break;
+                } else if(msg->command == CONN_TIMEOUT){
                     continue;
-                }else{
-                    cout<< "While listnening got unknown command: [" << msg->command << "] at "<< msg->timestamp << endl;
+                } else {
+                    std::cout<< "While listnening got unknown command: [" << msg->command << "] at "<< msg->timestamp << std::endl;
                     break;
                 }
-            } else if(msg->command == CONN_ERROR) {
-                cout<< "While listnening got error: [" << msg->data << "] at "<< msg->timestamp << endl;
-                break;
-            } else if(msg->command == CONN_TIMEOUT){
-                continue;
-            } else {
-                cout<< "While listnening got unknown command: [" << msg->command << "] at "<< msg->timestamp << endl;
-                break;
             }
-        }
-        auto hub = owner;
-        auto uid = id;
+            auto hub = owner;
+            auto uid = id;
 
-        hub->pool.post([hub, uid] {
-            hub->disconnectUser(uid);
-        });
-    }
+            {
+                std::unique_lock<std::mutex> lock(owner->acceptingMutex);
+                if (!owner->living) return;
+            }
+            hub->pool.post([hub, uid] {
+                hub->disconnectUser(uid);
+            });
+        }
 
     bool sendAll(char* data, int len) {
         int sent = 0;
@@ -171,8 +179,8 @@ private:
         return true;
     }
 
-    bool detectRcvError (int res, shared_ptr<MSG> msg){
-        msg->timestamp = chrono::duration_cast<chrono::seconds>(chrono::system_clock::now().time_since_epoch()).count();
+    bool detectRcvError (int res, std::shared_ptr<MSG> msg){
+        msg->timestamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         if (res == -1) return false;
         if (res == 2) {
             msg->command = CONN_TIMEOUT;
@@ -181,7 +189,7 @@ private:
         }
         if (res == 1) {
             msg->command = CONN_ERROR;
-            msg->data = to_string(WSAGetLastError());
+            msg->data = std::to_string(WSAGetLastError());
             return true;
         }
         if (res == 0) {
@@ -190,7 +198,7 @@ private:
             return true;
         }
         msg->command = CONN_ERROR;
-        msg->data = to_string(WSAGetLastError());
+        msg->data = std::to_string(WSAGetLastError());
         return true;
     }
 
@@ -217,7 +225,7 @@ private:
         return -1;
     }
 
-    bool recvMsg(shared_ptr<MSG> msg) {
+    bool recvMsg(std::shared_ptr<MSG> msg) {
         uint32_t n;
         int res = recvAll((char*)&n, 4);
         bool err = detectRcvError(res, msg);
@@ -226,11 +234,12 @@ private:
 
         uint32_t bytes = n >> 8;
         if(bytes>DEFAULT_PAYLOAD_LENGTH) {
-            msg->timestamp = chrono::duration_cast<chrono::seconds>(
-                chrono::system_clock::now().time_since_epoch()
+            msg->timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()
             ).count();
             msg->command = CONN_ERROR;
             msg->data = "PAYLOAD_TOO_LARGE";
+            return false;
         };
         uint8_t command = n & 0xFF;
         
@@ -243,14 +252,14 @@ private:
         return true;
     }
 
-    mutex listneningM;
-    bool listneningAA{true};
-    bool listneningRN{true};
-    condition_variable listneningVar;
+    std::mutex listneningM;
+    bool living{true};
+    bool listnening{true};
+    std::condition_variable listneningVar;
     HUB* owner;
-    mutex sendM;
+    std::mutex sendM;
     SOCKET clientSocket;
-    thread listenThread;
+    std::thread listenThread;
 };
 
 class HUB{
@@ -269,19 +278,19 @@ public:
         hints.ai_flags = AI_PASSIVE;
 
         acres = getaddrinfo(NULL, port, &hints, &result);
-        if (acres != 0) throw runtime_error("getaddrinfo failed with error: " + to_string(acres));
+        if (acres != 0) throw std::runtime_error("getaddrinfo failed with error: " + std::to_string(acres));
 
         acceptingSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
         if (acceptingSocket == INVALID_SOCKET) {
             freeaddrinfo(result);
-            throw runtime_error("socket failed with error: " + to_string(WSAGetLastError()));
+            throw std::runtime_error("socket failed with error: " + std::to_string(WSAGetLastError()));
         }
 
         acres = bind(acceptingSocket, result->ai_addr, (int)result->ai_addrlen);
         if (acres == SOCKET_ERROR) {
             freeaddrinfo(result);
             closesocket(acceptingSocket);
-            throw runtime_error("bind failed with error: " + to_string(WSAGetLastError()));
+            throw std::runtime_error("bind failed with error: " + std::to_string(WSAGetLastError()));
         }
 
         freeaddrinfo(result);
@@ -289,22 +298,22 @@ public:
         acres = listen(acceptingSocket, SOMAXCONN);
         if (acres == SOCKET_ERROR) {
             closesocket(acceptingSocket);
-            throw runtime_error("listen failed with error: " + to_string(WSAGetLastError()));
+            throw std::runtime_error("listen failed with error: " + std::to_string(WSAGetLastError()));
         }
 
-        acceptingThread = thread(&HUB::acceptNewSockets, this);
+        acceptingThread = std::thread(&HUB::acceptNewSockets, this);
     }
 
     ~HUB(){
         
         {
-            lock_guard<mutex> lk(acceptingMutex);
-            acceptingAA = false;
+            std::lock_guard<std::mutex> lk(acceptingMutex);
+            living = false;
         }
 
         {
-            unique_lock<mutex> lk(pool.m);
-            pool.stopAA = true;
+            std::unique_lock<std::mutex> lk(pool.m);
+            pool.living = false;
         }
         acceptingVar.notify_all();
         if (acceptingThread.joinable()) acceptingThread.join();
@@ -314,7 +323,7 @@ public:
         }
 
         {   
-            shared_lock<shared_mutex> lk(usersM);
+            std::shared_lock<std::shared_mutex> lk(usersM);
             for (auto& [id, user] : users) {
                 user->stopListening();
             }
@@ -325,28 +334,28 @@ public:
 
     void startAccepting(){ 
         {
-            lock_guard<mutex> lk(acceptingMutex);
-            acceptingRN = true;
+            std::lock_guard<std::mutex> lk(acceptingMutex);
+            accepting = true;
         }
         acceptingVar.notify_all();
     }
 
     void stopAccepting(){ 
-        lock_guard<mutex> lk(acceptingMutex);
-        acceptingRN = false;
+        std::lock_guard<std::mutex> lk(acceptingMutex);
+        accepting = false;
     }
 
-    void disconnectUser(string id){
-        unique_lock<shared_mutex> lk(usersM);
+    void disconnectUser(std::string id){
+        std::unique_lock<std::shared_mutex> lk(usersM);
         users.erase(id);
     }
 
-    void sendToAll(shared_ptr<MSG> msg, string exception){
+    void sendToAll(std::shared_ptr<MSG> msg, std::string exception){
         std::unique_ptr<std::shared_ptr<USER>[]> snapshot;
         size_t len = 0;
         {   
-            shared_lock<shared_mutex> lk(usersM);
-            snapshot = make_unique<shared_ptr<USER>[]>(users.size());
+            std::shared_lock<std::shared_mutex> lk(usersM);
+            snapshot = std::make_unique<std::shared_ptr<USER>[]>(users.size());
             for (auto& [id, user] : users) {
                 if (id == exception) continue;
                 snapshot[len++] = user;
@@ -358,14 +367,17 @@ public:
         return;
     }
 
+    std::mutex acceptingMutex;
+    bool living{true};
+
 private:
     void acceptNewSockets() {
         while (true) {
             {
-                unique_lock<mutex> lock(acceptingMutex);
-                acceptingVar.wait(lock, [this] { return !acceptingAA || acceptingRN; });
+                std::unique_lock<std::mutex> lock(acceptingMutex);
+                acceptingVar.wait(lock, [this] { return !living || accepting; });
 
-                if (!acceptingAA) break;
+                if (!living) break;
             }
             fd_set readfds;
             FD_ZERO(&readfds);
@@ -376,13 +388,13 @@ private:
 
             int r = select(0, &readfds, nullptr, nullptr, &tv);
             {
-                lock_guard<mutex> lk(acceptingMutex);
-                if (!acceptingAA) break;
-                if (!acceptingRN) continue;
+                std::lock_guard<std::mutex> lk(acceptingMutex);
+                if (!living) break;
+                if (!accepting) continue;
             }
 
             if (r == SOCKET_ERROR) {
-                cout << "select error: " << WSAGetLastError() << "\n";
+                std::cout << "select error: " << WSAGetLastError() << "\n";
                 continue;
             }
             if (r == 0) continue;
@@ -390,21 +402,21 @@ private:
             if (FD_ISSET(acceptingSocket, &readfds)) {
                 SOCKET connectedSocket = accept(acceptingSocket, NULL, NULL);
                 if (connectedSocket == INVALID_SOCKET) {
-                    cout << "accept error: " << WSAGetLastError() << "\n";
+                    std::cout << "accept error: " << WSAGetLastError() << "\n";
                     continue;
                 }
 
                 try { 
-                    shared_ptr<USER> newUser = make_shared<USER>(connectedSocket, this);
+                    std::shared_ptr<USER> newUser = std::make_shared<USER>(connectedSocket, this);
                     {
-                        unique_lock<shared_mutex> lk(usersM);
+                        std::unique_lock<std::shared_mutex> lk(usersM);
                         users[newUser->id] = newUser;
                     }
-                    cout<<"Accepted: "<<newUser->id<<endl;
+                    std::cout<<"Accepted: "<<newUser->id<<std::endl;
                 }
-                catch(const exception& e){
-                    cerr << "GetId error: " << e.what() << "        ";
-                    cerr << "Type: " << typeid(e).name() << endl;
+                catch(const std::exception& e){
+                    std::cerr << "GetId error: " << e.what() << "        ";
+                    std::cerr << "Type: " << typeid(e).name() << std::endl;
                     closesocket(connectedSocket);
                     continue;
                 }
@@ -412,14 +424,12 @@ private:
         }
     }
 
-    mutex acceptingMutex;
-    bool acceptingAA{true};
-    bool acceptingRN{false};
-    condition_variable acceptingVar;
-    thread acceptingThread;
+    bool accepting{true};
+    std::condition_variable acceptingVar;
+    std::thread acceptingThread;
     SOCKET acceptingSocket;
-    shared_mutex usersM;
-    unordered_map<string, shared_ptr<USER>> users;
+    std::shared_mutex usersM;
+    std::unordered_map<std::string, std::shared_ptr<USER>> users;
 public:
     THREAD_POOL pool;
 };
